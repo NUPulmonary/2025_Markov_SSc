@@ -7,5 +7,5 @@ The code was run with Python 3.9, and we used 4 virtual environments for that: `
 
 - 00_clinical: (clin), clinical data preprocessing, aggregation, plots & tables
 - 01_ssc-bal: (default), scRNAseq samples processing with 10x cellranger
-- 02_duke: (default), scRNAseq samples processing
+- 02_control-bal: (default), scRNAseq samples processing
 - 03_bal-object: (varies per notebook), scRNAseq BAL object integration, analysis and plots
