@@ -1,0 +1,11 @@
+pandas
+openpyxl
+matplotlib
+seaborn
+tableone
+
+# pinned because newer version requires Rust to figure out dependencies : /
+jupyterlab<3.6
+jupyterlab-server
+ipykernel
+

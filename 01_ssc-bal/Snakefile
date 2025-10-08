@@ -1,0 +1,531 @@
+import os
+import sys
+sys.path.insert(0, "../lib")
+
+import numpy as np
+import pandas as pd
+
+import snake
+import integrate
+import run_scrublet
+
+
+R_OPTS = "--no-site-file --no-environ --no-restore"
+
+DATA_DIR = "../../data/01ssc-bal"
+
+SAMPLES = pd.read_csv("samples.csv")
+SAMPLES.loc[SAMPLES.Sample.str.len() == 4, "Sample"] = "SC0" + SAMPLES.Sample[SAMPLES.Sample.str.len() == 4].str[-2:]
+
+
+def get_count_input_file(wildcards):
+    short_sample = SAMPLES.Sample[SAMPLES.External_ID == wildcards.sample].values[0]
+    if len(short_sample) == 4:
+        long_sample = "SC0" + long_sample[-2:]
+    else:
+        long_sample = short_sample
+    if os.path.exists(f"{DATA_DIR}/fastq/{long_sample}"):
+        return [f"{DATA_DIR}/fastq/{long_sample}"]
+    run_ids = SAMPLES.RunID[SAMPLES.External_ID == wildcards.sample].values
+    return [f"{DATA_DIR}/fastq-run/{run_id}" for run_id in run_ids]
+
+
+def fastq_sample_name(wildcards, input):
+    short_sample = SAMPLES.Sample[SAMPLES.External_ID == wildcards.sample].values[0]
+    if len(short_sample) == 4:
+        long_sample = "SC0" + long_sample[-2:]
+    else:
+        long_sample = short_sample
+        short_sample = long_sample[:2] + long_sample[-2:]
+    for root, dirs, files in os.walk(input[0]):
+        for f in files:
+            if f.endswith(".fastq.gz"):
+                if f.startswith(long_sample):
+                    return long_sample
+                if f.startswith(short_sample):
+                    return short_sample
+    return wildcards.sample
+
+
+rule all:
+    input:
+       expand("{dir}/scanpy/{sample}/{sample}.h5ad", dir=DATA_DIR, sample=SAMPLES.External_ID),
+       expand("{dir}/scanpy-cb/{sample}/{sample}.h5ad", dir=DATA_DIR, sample=SAMPLES.External_ID),
+       expand("{dir}/cellbender/{sample}_filtered.h5", dir=DATA_DIR, sample=SAMPLES.External_ID),
+       f"{DATA_DIR}/cellranger/metrics_summary.csv",
+       expand("{dir}/cellbrowser/{sample}.tar.gz", dir=DATA_DIR, sample=SAMPLES.External_ID),
+       expand("{dir}/cellbrowser-cb/{sample}v3.tar.gz", dir=DATA_DIR, sample=SAMPLES.External_ID),
+        expand("{dir}/velocyto/{sample}.loom", dir=DATA_DIR, sample=SAMPLES.External_ID)
+
+
+rule velocyto:
+    input: "{dir}/cellranger/{sample}"
+    output: "{dir}/velocyto/{sample}.loom"
+    params:
+        slurm__account="p31841",
+        slurm__partition="normal",
+        slurm__hours=12,
+        slurm__cores=8,
+        slurm__mem=60,
+        gtf="/projects/b1038/tools/refdata-cellranger-GRCh38-1.2.0/genes/genes.gtf"
+    wrapper:
+        "file:../lib/wrappers/velocyto"
+
+
+rule cellbrowser_cb:
+    input:
+        h5ad="{dir}/scanpy-cb/{sample}/{sample}.h5ad",
+        meta="{dir}/scanpy-cb/{sample}/{sample}-metadata.csv",
+        markers="{dir}/scanpy-cb/{sample}/{sample}-markers.csv",
+    output: "{dir}/cellbrowser-cb/{sample}v3.tar.gz"
+    params:
+        # slurm__account="b1038",
+        # slurm__partition="b1038",
+        slurm__hours=2,
+        slurm__cores=4,
+        slurm__mem=32,
+    shell:
+        """
+        h5=`realpath {input.h5ad}`
+        out_file=`realpath {output}`
+        base_dir=`dirname $out_file`
+
+        meta=`realpath "{input.meta}"`
+        meta_file=`basename $meta`
+        markers=`realpath "{input.markers}"`
+        markers_file=`basename $markers`
+
+        mkdir -p $base_dir
+        fname=`basename {output}`
+        out=${{fname%.tar.gz}}
+        out_dir="$base_dir/$out"
+        rm -rf "$out_dir"
+        pipenv run cbImportScanpy -i $h5 -o $out_dir
+
+        echo "Sedding"
+        sed -i 's/louvain/leiden/g' "$out_dir/cellbrowser.conf"
+        sed -i 's/#radius=2/radius=2/' "$out_dir/cellbrowser.conf"
+        sed -i "s/meta.tsv/$meta_file/" "$out_dir/cellbrowser.conf"
+
+        echo -e "\ndisplay_single_meta=True" >> "$out_dir/cellbrowser.conf"
+        echo -e "\nmarkers = [{{\\"file\\": \\"$markers_file\\", \\"shortLabel\\":\\"Cluster Markers\\"}}]\n" \
+            >> "$out_dir/cellbrowser.conf"
+
+        cp "$meta" "$markers" $out_dir
+
+        echo "Tarring to ${{out}}.tar.gz"
+        tar -czf {output} $out_dir
+        rm -rf $out_dir
+        """
+
+
+rule cellbrowser:
+    input:
+        h5ad="{dir}/scanpy/{sample}/{sample}.h5ad",
+        meta="{dir}/scanpy/{sample}/{sample}-metadata.csv",
+        markers="{dir}/scanpy/{sample}/{sample}-markers.csv",
+    output: "{dir}/cellbrowser/{sample}.tar.gz"
+    params:
+        # slurm__account="b1038",
+        # slurm__partition="b1038",
+        slurm__hours=2,
+        slurm__cores=4,
+        slurm__mem=32,
+        upload_dir="ftp://ftp.box.com/SSc-ILD/01_Data/02_Cellbrowser/"
+    shell:
+        """
+        h5=`realpath {input.h5ad}`
+        out_file=`realpath {output}`
+        base_dir=`dirname $out_file`
+
+        meta=`realpath "{input.meta}"`
+        meta_file=`basename $meta`
+        markers=`realpath "{input.markers}"`
+        markers_file=`basename $markers`
+
+        mkdir -p $base_dir
+        fname=`basename {output}`
+        out=${{fname%.tar.gz}}
+        out_dir="$base_dir/$out"
+        rm -rf "$out_dir"
+        pipenv run cbImportScanpy -i $h5 -o $out_dir
+
+        echo "Sedding"
+        sed -i 's/louvain/leiden/g' "$out_dir/cellbrowser.conf"
+        sed -i 's/#quickGenesFile/quickGenesFile/' "$out_dir/cellbrowser.conf"
+        sed -i 's/#radius=2/radius=2/' "$out_dir/cellbrowser.conf"
+        sed -i "s/meta.tsv/$meta_file/" "$out_dir/cellbrowser.conf"
+
+        echo -e "\ndisplay_single_meta=True" >> "$out_dir/cellbrowser.conf"
+        echo -e "\nmarkers = [{{\\"file\\": \\"$markers_file\\", \\"shortLabel\\":\\"Cluster Markers\\"}}]\n" \
+            >> "$out_dir/cellbrowser.conf"
+
+        cp "$meta" "$markers" $out_dir
+
+        echo "Tarring to ${{out}}.tar.gz"
+        tar -czf {output} $out_dir
+        rm -rf $out_dir
+        """
+
+
+rule seurat:
+    input:
+        "{dir}/{sample}",
+    output:
+        "{dir}/{sample}.rds",
+    params:
+        # slurm__partition="genomics-himem",
+        slurm__hours=2,
+        slurm__cores=4,
+        slurm__mem=42
+    shell:
+        """
+        module purge all
+        module load R/3.6.3
+
+        input=`realpath {input}`
+        output=`realpath {output[0]}`
+        samples=`realpath samples.csv`
+
+        Rscript {R_OPTS} lib-r/seurat.R "{wildcards.sample}" \
+            "$input" \
+            "$output" \
+            "$samples"
+        """
+
+
+rule h5ad_cb:
+    input:
+        matrix="{dir}/cellbender/{sample}_filtered.h5",
+        sct_counts="{dir}/sct-cb/{sample}/log-counts.mtx",
+        sct_hvg="{dir}/sct-cb/{sample}/hvg-scaled.tsv",
+        sample_meta=ancient("../00all-samples.csv"),
+        doublets="{dir}/scrublet-cb/{sample}_doublets.csv",
+    output:
+        h5ad="{dir}/scanpy-cb/{sample}/{sample}.h5ad",
+        meta="{dir}/scanpy-cb/{sample}/{sample}-metadata.csv",
+        markers="{dir}/scanpy-cb/{sample}/{sample}-markers.csv",
+    params:
+        slurm__hours=1,
+        slurm__cores=4,
+        slurm__mem=42
+    run:
+        snake.prepare_sample(
+            **input,
+            **output,
+            sample=wildcards.sample,
+            min_genes=200,
+            min_cells=5,
+            n_pcs=40,
+            resolution=0.5
+        )
+
+
+rule h5ad:
+    input:
+        matrix="{dir}/fastcar/{sample}",
+        sct_counts="{dir}/sct/{sample}/log-counts.mtx",
+        sct_hvg="{dir}/sct/{sample}/hvg-scaled.tsv",
+        sample_meta=ancient("../00all-samples.csv"),
+        doublets="{dir}/scrublet/{sample}_doublets.csv",
+    output:
+        h5ad="{dir}/scanpy/{sample}/{sample}.h5ad",
+        meta="{dir}/scanpy/{sample}/{sample}-metadata.csv",
+        markers="{dir}/scanpy/{sample}/{sample}-markers.csv",
+    params:
+        slurm__hours=1,
+        slurm__cores=4,
+        slurm__mem=42
+    run:
+        snake.prepare_sample(
+            **input,
+            **output,
+            sample=wildcards.sample,
+            min_genes=200,
+            min_cells=5,
+            n_pcs=40,
+            resolution=0.5
+        )
+
+
+rule sctransform_cellbender:
+    input:
+        "{dir}/cellbender/{sample}_filtered.h5",
+        "{dir}/scrublet-cb/{sample}_doublets.csv",
+        "{dir}/scrublet-cb/{sample}_threshold.txt",
+    output:
+        "{dir}/sct-cb/{sample}/log-counts.mtx",
+        "{dir}/sct-cb/{sample}/hvg-scaled.tsv",
+    params:
+        slurm__hours=4,
+        slurm__cores=4,
+        slurm__mem=42,
+        min_cells=3,
+        min_features=200,
+        hvg_genes=3000
+    shell:
+        """
+        module purge all
+        module load R/4.0.3
+        module load hdf5/1.8.19-serial
+
+        output=`dirname "{output[0]}"`
+        output=`realpath $output`
+        mkdir -p "$output"
+        input_dir=`basename $(realpath .)`
+
+        cd .. # to pick up project renv
+
+        Rscript {R_OPTS} lib-r/sctransform_cb.R "$input_dir/{input[0]}" \
+            "$input_dir/{input[1]}" \
+            "$input_dir/{input[2]}" \
+            "$output" \
+            {params.hvg_genes} \
+            {params.min_cells} \
+            {params.min_features}
+        """
+
+
+rule sctransform:
+    input:
+        "{dir}/fastcar/{sample}",
+        "{dir}/scrublet/{sample}_doublets.csv",
+        "{dir}/scrublet/{sample}_threshold.txt",
+    output:
+        "{dir}/sct/{sample}/log-counts.mtx",
+        "{dir}/sct/{sample}/hvg-scaled.tsv",
+    params:
+        slurm__hours=4,
+        slurm__cores=4,
+        slurm__mem=42,
+        min_cells=3,
+        min_features=200,
+        hvg_genes=3000
+    shell:
+        """
+        module purge all
+        module load R/4.0.3
+
+        output=`dirname "{output[0]}"`
+        output=`realpath $output`
+        mkdir -p "$output"
+        input_dir=`basename $(realpath .)`
+
+        cd .. # to pick up project renv
+
+        Rscript {R_OPTS} lib-r/sctransform.R "$input_dir/{input[0]}" \
+            "$input_dir/{input[1]}" \
+            "$input_dir/{input[2]}" \
+            "$output" \
+            {params.hvg_genes} \
+            {params.min_cells} \
+            {params.min_features}
+        """
+
+
+rule metrics_summary:
+    input:
+        expand("{{dir}}/cellranger/{sample}", sample=SAMPLES.External_ID.unique())
+    output: "{dir}/cellranger/metrics_summary.csv"
+    params:
+        slurm__skip=True
+    run:
+        result = []
+        for sample in input:
+            m = pd.read_csv(f"{sample}/outs/metrics_summary.csv")
+            m.insert(0, "Sample", os.path.basename(sample))
+            result.append(m)
+        result = sorted(result, key=lambda x: x.shape[1], reverse=True)
+        result = pd.concat(result, sort=False)
+        for column in result.columns:
+            if result[column].dtype not in ("int64", "float64"):
+                match = (~result[column].isna()) & result[column].str.match(r"^(\d+,)*\d+$")
+                new_column = result[column].copy()
+                new_column[match] = new_column.loc[match].str.replace(",", "")
+                result[column] = new_column
+        result.sort_values("Sample").to_csv(output[0], index=False)
+
+
+rule cellbender:
+    input:
+        "{dir}/cellranger/{sample}"
+    output:
+        "{dir}/cellbender/{sample}_filtered.h5",
+        "{dir}/cellbender/{sample}_cell_barcodes.csv",
+    params:
+        slurm__hours=10,
+        slurm__cores=8,
+        slurm__mem=40,
+        slurm__partition="gengpu",
+        slurm__account="p31014",
+        slurm__gres="gpu:k80:1",
+        exp_cells=lambda wildcards: int(SAMPLES["Expected cells"][SAMPLES.External_ID == wildcards.sample].values[0]),
+        droplets=lambda wildcards: int(SAMPLES["Total droplets"][SAMPLES.External_ID == wildcards.sample].values[0]),
+        learning_rate=0.0001
+    shell:
+        """
+        input=`realpath {input}`
+        output=`realpath {output[0]}`
+        output="${{output%_filtered.h5}}.h5"
+
+        if [[ ! -d `dirname "$output"` ]]; then
+            mkdir `dirname "$output"`
+        fi
+
+        pipenv run cellbender remove-background \
+            --cuda \
+            --input "$input/outs/raw_feature_bc_matrix.h5" \
+            --output "$output" \
+            --expected-cells {params.exp_cells} \
+            --total-droplets-included {params.droplets} \
+            --learning-rate {params.learning_rate} \
+            --epochs 200
+        """
+
+
+rule fastcar:
+    input:
+        "{dir}/cellranger/{sample}"
+    output:
+        directory("{dir}/fastcar/{sample}")
+    params:
+        slurm__hours=1,
+        slurm__cores=4,
+        slurm__mem=40,
+        cutoff="300",
+        prob="0.03"
+    shell:
+        """
+        module purge all
+        module load R/4.0.3
+        module load hdf5/1.8.19-serial
+
+        input=`realpath {input}`
+        filtered_h5=`find $input -maxdepth 1 -name "filtered*.h5" -print -quit`
+        raw_h5=`find $input -maxdepth 1 -name "raw*.h5" -print -quit`
+
+        if [[ -n $filtered_h5 && -n $raw_h5 ]]; then
+            input_filtered=$filtered_h5
+            input_raw=$raw_h5
+        else
+            input_filtered=`realpath {input}`/outs/filtered_feature_bc_matrix.h5
+            input_raw=`dirname $input_filtered`/raw_feature_bc_matrix.h5
+        fi
+
+        output=`realpath {output}`
+        mkdir -p $output
+
+        cd .. # to pick up project renv
+
+        Rscript {R_OPTS} lib-r/fastcar.R \
+            "$input_filtered" \
+            "$input_raw" \
+            "$output" \
+            {params.cutoff} \
+            {params.prob}
+        """
+
+
+rule scrublet_cellbender:
+    input:
+        "{dir}/cellranger/{sample}",
+        "{dir}/cellbender/{sample}_cell_barcodes.csv",
+    output:
+        "{dir}/scrublet-cb/{sample}_doublets.csv",
+        "{dir}/scrublet-cb/{sample}_threshold.txt"
+    params:
+        slurm__hours=1,
+        slurm__cores=12,
+        slurm__mem=8
+    run:
+        run_scrublet.run_scrublet(
+            os.path.join(input[0], "outs"),
+            save_to=output[0].replace("doublets.csv", ""),
+            barcodes=input[1],
+        )
+
+
+rule scrublet:
+    input:
+        "{dir}/cellranger/{sample}"
+    output:
+        "{dir}/scrublet/{sample}_doublets.csv",
+        "{dir}/scrublet/{sample}_threshold.txt"
+    params:
+        slurm__hours=1,
+        slurm__cores=12,
+        slurm__mem=8
+    run:
+        run_scrublet.run_scrublet(
+            os.path.join(input[0], "outs"),
+            save_to=output[0].replace("doublets.csv", "")
+        )
+
+
+rule cellranger:
+    input: get_count_input_file
+    output: directory(f"{DATA_DIR}/cellranger/{{sample,\w+}}")
+    params:
+        #slurm__account="b1038",
+        # slurm__partition="genomics-himem",
+        slurm__cores=8,
+        slurm__hours=16,
+        slurm__mem=60,
+        # input_paths=lambda wildcards, input: ",".join(("../" + i[len("../../data/"):] for i in input)),
+        input_paths=lambda wildcards, input: ",".join([os.path.realpath(i) for i in input]),
+        chemistry="auto",
+        transcriptome="/projects/b1038/tools/refdata-cellranger-GRCh38-1.2.0/",
+        sample=fastq_sample_name
+    shell:
+        """
+        module purge all
+        module load cellranger/3.1.0
+
+        cd `dirname {output}`
+        cellranger count --id {wildcards.sample} \
+            --sample={params.sample} \
+            --transcriptome={params.transcriptome} \
+            --fastqs={params.input_paths} \
+            --chemistry={params.chemistry}
+        """
+
+
+rule demultiplex:
+    input:
+        "../../raw/{RunID}",
+        "../../data/{RunID,\w+}.csv"
+    output: directory(f"{DATA_DIR}/fastq-run/{{RunID}}")
+    params:
+        slurm__partition="genomics-himem",
+        slurm__cores=8,
+        slurm__hours=6,
+        slurm__mem=40,
+        lanes=lambda wildcards: ",".join(np.unique(SAMPLES.Lane[SAMPLES.RunID == wildcards.RunID].astype(str))),
+        flowcell=lambda wildcards: wildcards.RunID.split("_")[-1][1:]
+    shell:
+        """
+        module purge all
+        module load bcl2fastq
+        module load cellranger/3.1.0
+
+        cellranger mkfastq --run={input[0]} \
+            --csv={input[1]} \
+            --output-dir={output[0]}
+
+        rm -rf {params.flowcell}
+        rm __{params.flowcell}.mro
+        """
+
+
+rule prepare_samples:
+    input: ancient("samples.csv")
+    output: "../../data/{RunID,\w+}.csv"
+    params:
+        slurm__skip=1
+    run:
+        samples = SAMPLES.loc[SAMPLES.RunID == wildcards.RunID, ["Lane", "External_ID", "Index"]]
+        samples.columns = ["Lane", "Sample", "Index"]
+        samples.to_csv(
+            output[0],
+            index=False
+        )

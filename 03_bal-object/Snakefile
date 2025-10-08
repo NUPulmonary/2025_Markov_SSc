@@ -1,0 +1,235 @@
+import os
+import sys
+
+import pandas as pd
+
+
+R_OPTS = "--no-site-file --no-environ --no-restore"
+
+
+DATA_DIR = "../../data/31_bal-object"
+PSEUDOBULK_DIR = f"{DATA_DIR}/04bal-object/DEG/pseudobulk/output"
+GSEA_DIR = f'{DATA_DIR}/11e_degs_gsea'
+GSEA_DIR_2 = f'{DATA_DIR}/15d_degs_mmf_gsea'
+
+GSEA_CELL_TYPES = list(filter(
+    lambda x: os.path.isdir(os.path.join(GSEA_DIR, x)) and not x.startswith('__'), 
+    os.listdir(GSEA_DIR)
+))
+
+GSEA_CELL_TYPES_2 = list(filter(
+    lambda x: os.path.isdir(os.path.join(GSEA_DIR_2, x)) and not x.startswith('__'), 
+    os.listdir(GSEA_DIR_2)
+))
+
+# PSEUDOBULK_CELL_TYPES = list(filter(
+#     lambda x: os.path.isdir(os.path.join(PSEUDOBULK_DIR, x)) and not x.startswith('__'), 
+#     os.listdir(PSEUDOBULK_DIR)
+# ))
+# 
+# MARKERS_DIR = f"{DATA_DIR}/04bal-object/markers"
+# MARKERS_CELL_TYPES = list(filter(
+#     lambda x: os.path.isdir(os.path.join(MARKERS_DIR, x)),
+#     os.listdir(MARKERS_DIR)
+# ))
+
+
+rule all:
+    input:
+        f"{DATA_DIR}/cellbrowser/03_bal-object.tar.gz",
+        #f"{DATA_DIR}/cellbrowser/04bal-object.tar.gz",
+        #f"{DATA_DIR}/cellbrowser/05spectra.tar.gz",
+        #f"{DATA_DIR}/cellbrowser/06spectra.tar.gz",
+        #f"{DATA_DIR}/cellbrowser/08spectra.tar.gz",
+        f"{DATA_DIR}/cellbrowser/14a_spectra.tar.gz",
+        #expand(f"{PSEUDOBULK_DIR}/{{ct}}/homer-up", ct=PSEUDOBULK_CELL_TYPES),
+        #expand(f"{PSEUDOBULK_DIR}/{{ct}}/homer-down", ct=PSEUDOBULK_CELL_TYPES),
+        #expand(f"{MARKERS_DIR}/{{ct}}/homer", ct=MARKERS_CELL_TYPES),
+        expand(f'{GSEA_DIR}/{{ct}}/gsea.csv', ct=GSEA_CELL_TYPES),
+        expand(f'{GSEA_DIR_2}/{{ct}}/gsea.csv', ct=GSEA_CELL_TYPES_2)
+
+
+rule gsea:
+    input: ancient('{dir}/{ct}/degs.csv')
+    output: '{dir}/{ct}/gsea.csv'
+    params:
+        slurm__hours=24,
+        slurm__cores=32,
+        slurm__mem=10,
+    run:
+        import json
+        import hashlib
+        import os
+        import sys
+        import decoupler
+        import pandas as pd
+
+        msigdb = decoupler.get_resource('MSigDB', organism='human')
+        hallmark = msigdb[msigdb.collection.eq('hallmark')]
+        hallmark = hallmark[~hallmark.duplicated(['geneset', 'genesymbol'])]
+        PF_GENESET_URL = (
+            'https://maayanlab.cloud/Harmonizome/api/1.0/gene_set/'
+            'pulmonary+fibrosis/DISEASES+Text-mining+Gene-Disease+Assocation+Evidence+Scores'
+        )
+        PF_GENESET_FILE = 'Harmonizome_PF_set.json'
+        PF_GENESET_SHA1 = '3f3dd4f618e335382982d16e0afae9f2240dcbd6'
+        if not os.path.exists(PF_GENESET_FILE):
+            with open(PF_GENESET_FILE, 'w') as f:
+                contents = requests.get(PF_GENESET_URL).text
+                f.write(contents)
+                print(f'Downloaded PF geneset with sha1 {hashlib.sha1(contents.encode()).hexdigest()}')
+        contents = open(PF_GENESET_FILE).read()
+        if hashlib.sha1(contents.encode()).hexdigest() != PF_GENESET_SHA1:
+            print('SHA1 of PF gene set does not match the stored one')
+            sys.exit(1)
+        pf_genes = json.loads(contents)
+        pf_genes = [x['gene']['symbol'] for x in pf_genes['associations']]
+
+        keggdb = decoupler.get_resource('KEGG-PC', organism='human')
+        purine_pathway = keggdb.loc[keggdb.pathway.str.contains('Purine')]
+        purine_pathway.rename(columns={'pathway': 'geneset'}, inplace=True)
+        purine_pathway['collection'] = 'KEGG'
+
+        hallmark = pd.concat([
+            hallmark,
+            pd.DataFrame(dict(genesymbol=pf_genes, collection='Harmonizome', geneset='Harmonizome_PF')),
+            purine_pathway
+        ])
+
+        degs = pd.read_csv(input[0], index_col=0)
+
+        enriched = decoupler.get_gsea_df(
+            df=degs,
+            stat='log2FoldChange',
+            net=hallmark,
+            source='geneset',
+            target='genesymbol',
+            times=10_000_000,
+            seed=1066
+        )
+        enriched['cell_type'] = wildcards.ct
+        enriched['n_genes'] = len(degs)
+        enriched['n_degs'] = degs.padj.lt(0.05).sum()
+        enriched.to_csv(output[0])
+
+
+rule homer:
+    output: directory("{dir}/homer")
+    params:
+        slurm__hours=1,
+        slurm__cores=4,
+        slurm__mem=10,
+    shell:
+        """
+        module load homer/4.10
+
+        dir=`dirname {output}`
+        n_degs=`wc -l $dir/marker-genes.csv | cut -f1 -d" "`
+        if [[ $((n_degs)) -gt 10 ]]; then
+            findMotifs.pl $dir/marker-genes.csv human {output} -p 4 -bg {DATA_DIR}/04bal-object/04bal-object-genes.txt
+        else
+            mkdir {output}
+            echo "Less than 10 genes" >> {output}/result.txt
+        fi
+        """
+
+
+rule homer_up:
+    output: directory("{dir}/homer-up")
+    params:
+        slurm__hours=1,
+        slurm__cores=4,
+        slurm__mem=10,
+    shell:
+        """
+        module load homer/4.10
+
+        dir=`dirname {output}`
+        if [[ ! -f $dir/degs-upreg.csv ]]; then
+            mkdir {output}
+            echo "No upregulated genes" >> {output}/result.txt
+            exit
+        fi
+        n_degs=`wc -l $dir/degs-upreg.csv | cut -f1 -d" "`
+        if [[ $((n_degs)) -gt 10 ]]; then
+            cut -d, -f1 $dir/degs-filt.csv > $dir/degs-filt-names.csv
+            findMotifs.pl $dir/degs-upreg.csv human {output} -p 4 -bg $dir/degs-filt-names.csv
+        else
+            mkdir {output}
+            echo "Less than 10 genes" >> {output}/result.txt
+        fi
+        """
+
+
+rule homer_down:
+    output: directory("{dir}/homer-down")
+    params:
+        slurm__hours=1,
+        slurm__cores=4,
+        slurm__mem=10,
+    shell:
+        """
+        module load homer/4.10
+
+        dir=`dirname {output}`
+        if [[ ! -f $dir/degs-downreg.csv ]]; then
+            mkdir {output}
+            echo "No upregulated genes" >> {output}/result.txt
+            exit
+        fi
+        n_degs=`wc -l $dir/degs-downreg.csv | cut -f1 -d" "`
+        if [[ $((n_degs)) -gt 10 ]]; then
+            cut -d, -f1 $dir/degs-filt.csv > $dir/degs-filt-names.csv
+            findMotifs.pl $dir/degs-downreg.csv human {output} -p 4 -bg $dir/degs-filt-names.csv
+        else
+            mkdir {output}
+            echo "Less than 10 genes" >> {output}/result.txt
+        fi
+        """
+
+
+rule cellbrowser:
+    input:
+        h5ad="{dir}/{sample}/{sample}.h5ad",
+        meta="{dir}/{sample}/{sample}-metadata.csv",
+        markers="{dir}/{sample}/{sample}-markers.csv",
+    output: "{dir}/cellbrowser/{sample}.tar.gz"
+    params:
+        slurm__account="p31841",
+        slurm__partition="short",
+        slurm__hours=4,
+        slurm__cores=8,
+        slurm__mem=80,
+    shell:
+        """
+        h5=`realpath {input.h5ad}`
+        out_file=`realpath {output}`
+        base_dir=`dirname $out_file`
+
+        meta=`realpath "{input.meta}"`
+        meta_file=`basename $meta`
+        markers=`realpath "{input.markers}"`
+        markers_file=`basename $markers`
+
+        mkdir -p $base_dir
+        fname=`basename {output}`
+        out=${{fname%.tar.gz}}
+        out_dir="$base_dir/$out"
+        rm -rf "$out_dir"
+        cbImportScanpy -i $h5 -o $out_dir
+
+        echo "Sedding"
+        sed -i 's/louvain/leiden/g' "$out_dir/cellbrowser.conf"
+        sed -i 's/#radius=2/radius=2/' "$out_dir/cellbrowser.conf"
+        sed -i "s/meta.tsv/$meta_file/" "$out_dir/cellbrowser.conf"
+
+        echo -e "\ndisplay_single_meta=True" >> "$out_dir/cellbrowser.conf"
+        echo -e "\nmarkers = [{{\\"file\\": \\"$markers_file\\", \\"shortLabel\\":\\"Cluster Markers\\"}}]\n" \
+            >> "$out_dir/cellbrowser.conf"
+
+        cp "$meta" "$markers" $out_dir
+
+        echo "Tarring to ${{out}}.tar.gz"
+        tar -czf {output} $out_dir
+        rm -rf $out_dir
+        """

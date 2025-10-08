@@ -1,0 +1,18 @@
+ipykernel
+jupyterlab
+scvi-tools
+matplotlib
+seaborn
+torch-1.13.1+cu117.with.pypi.cudnn-cp39-cp39-linux_x86_64.whl
+numpy
+scanpy-utils
+scikit-misc # for seurat_v3 HVG selection
+leidenalg
+decoupler
+omnipath  # for decoupler to load MSigDB
+
+cellbrowser
+snakemake
+
+upsetplot
+

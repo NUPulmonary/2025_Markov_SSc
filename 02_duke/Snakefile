@@ -1,0 +1,98 @@
+import os
+import sys
+sys.path.insert(0, "../lib")
+
+import numpy as np
+import pandas as pd
+
+
+R_OPTS = "--no-site-file --no-environ --no-restore"
+
+DATA_DIR = "../../data/08_duke"
+
+SAMPLES = pd.read_csv("../00all-samples.csv")
+SAMPLES = SAMPLES.loc[SAMPLES.Study.eq('Duke')].copy()
+
+
+# Wildcard is External Sample ID
+def get_count_input_file(wildcards):
+    short_sample = SAMPLES['Sample ID'][SAMPLES['External Sample ID'] == wildcards.sample].values[0]
+    if len(short_sample) == 4:
+        long_sample = "SC0" + long_sample[-2:]
+    else:
+        long_sample = short_sample
+    assert os.path.exists(f"{DATA_DIR}/fastq/{long_sample}")
+    return [f"{DATA_DIR}/fastq/{long_sample}"]
+
+
+# Wildcard is External Sample ID
+def fastq_sample_name(wildcards, input):
+    short_sample = SAMPLES['Sample ID'][SAMPLES['External Sample ID'] == wildcards.sample].values[0]
+    if len(short_sample) == 4:
+        long_sample = "SC0" + long_sample[-2:]
+    else:
+        long_sample = short_sample
+        short_sample = long_sample[:2] + long_sample[-2:]
+    for root, dirs, files in os.walk(input[0]):
+        for f in files:
+            if f.endswith(".fastq.gz"):
+                if f.startswith(long_sample):
+                    return long_sample
+                if f.startswith(short_sample):
+                    return short_sample
+    return wildcards.sample
+
+
+rule all:
+    input:
+       f"{DATA_DIR}/cellranger/metrics_summary.csv",
+
+
+rule metrics_summary:
+    input:
+        expand("{{dir}}/cellranger/{sample}", sample=SAMPLES['External Sample ID'].unique())
+    output: "{dir}/cellranger/metrics_summary.csv"
+    params:
+        slurm__skip=True
+    run:
+        result = []
+        for sample in input:
+            m = pd.read_csv(f"{sample}/outs/metrics_summary.csv")
+            m.insert(0, "Sample", os.path.basename(sample))
+            result.append(m)
+        result = sorted(result, key=lambda x: x.shape[1], reverse=True)
+        result = pd.concat(result, sort=False)
+        for column in result.columns:
+            if result[column].dtype not in ("int64", "float64"):
+                match = (~result[column].isna()) & result[column].str.match(r"^(\d+,)*\d+$")
+                new_column = result[column].copy()
+                new_column[match] = new_column.loc[match].str.replace(",", "")
+                result[column] = new_column
+        result.sort_values("Sample").to_csv(output[0], index=False)
+
+
+rule cellranger:
+    input: get_count_input_file
+    output: directory(f"{DATA_DIR}/cellranger/{{sample,\w+}}")
+    params:
+        #slurm__account="b1038",
+        # slurm__partition="genomics-himem",
+        slurm__cores=8,
+        slurm__hours=16,
+        slurm__mem=60,
+        input_paths=lambda wildcards, input: ",".join([os.path.realpath(i) for i in input]),
+        chemistry="auto",
+        transcriptome="/projects/b1038/tools/refdata-cellranger-GRCh38-1.2.0/",
+        sample=fastq_sample_name
+    shell:
+        """
+        module purge all
+        module load cellranger/3.1.0
+
+        cd `dirname {output}`
+        cellranger count --id {wildcards.sample} \
+            --sample={params.sample} \
+            --transcriptome={params.transcriptome} \
+            --fastqs={params.input_paths} \
+            --chemistry={params.chemistry}
+        """
